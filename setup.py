@@ -8,6 +8,7 @@ setup(name='ldapdomaindump',
       packages=['ldapdomaindump'],
       requires_python=">=3.6",
       install_requires=['dnspython', 'ldap3>=2.5,!=2.5.2,!=2.5.0,!=2.6'],
+      extras_require={'test': ['pytest']},
       package_data={'ldapdomaindump': ['style.css']},
       include_package_data=True,
       entry_points= {

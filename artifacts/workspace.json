@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid31484",
+  "B": "/home/dev/feedback/uid31484",
+  "sha": "16039bfee27f921321333eb767adf107bde674ec",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "dirkjanm",
+    "repo": "ldapdomaindump",
+    "sha": "16039bfee27f921321333eb767adf107bde674ec"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "ldapdomaindump",
+    "cloneUrl": "https://github.com/Rrr119/ldapdomaindump.git"
+  },
+  "at": "2026-11-21T08:36:52.690Z"
+}

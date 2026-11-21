@@ -41,8 +41,9 @@ Help can be obtained with the -h switch:
 ```
 usage: ldapdomaindump.py [-h] [-u USERNAME] [-p PASSWORD] [-at {NTLM,SIMPLE}]
                          [-o DIRECTORY] [--no-html] [--no-json] [--no-grep]
-                         [--grouped-json] [-d DELIMITER] [-r] [-n DNS_SERVER]
-                         [-m]
+                         [--grouped-json] [-d DELIMITER] [-i]
+                         [--state-file FILE] [--page-size N] [--reset-state]
+                         [--no-deleted-check] [-r] [-n DNS_SERVER] [-m]
                          HOSTNAME
 
 Domain information dumper via LDAP. Dumps users/computers/groups and
@@ -74,6 +75,18 @@ Output options:
   -d DELIMITER, --delimiter DELIMITER
                         Field delimiter for greppable output (default: tab)
 
+Incremental options:
+  -i, --incremental     Collect only objects changed since the previous run
+                        using uSNChanged
+  --state-file FILE     Incremental checkpoint and inventory file (default:
+                        OUTDIR/.ldapdomaindump-state.json)
+  --page-size N         LDAP page size for incremental collection (default:
+                        500)
+  --reset-state         Discard the incremental checkpoint and start with a
+                        new baseline
+  --no-deleted-check    Do not query AD tombstones for deleted objects during
+                        incremental runs
+
 Misc options:
   -r, --resolve         Resolve computer hostnames (might take a while and
                         cause high traffic on large networks)
@@ -97,6 +110,23 @@ While this can be very useful, the DNSHostName attribute is not automatically up
 
 ### Minimizing network and memory usage
 By default ldapdomaindump will try to dump every single attribute it can read to disk in the .json files. In large networks, this uses a lot of memory (since group relationships are currently calculated in memory before being written to disk). To dump only the minimal required attributes (the ones shown by default in the .html and .grep files), use the `--minimal` switch.
+
+### Incremental collection
+Use `--incremental` to make repeated collections incremental. The first run is a full baseline. It stores a uSNChanged cursor and a lightweight object inventory in `.ldapdomaindump-state.json` inside the output directory. Later runs query only relevant objects with a higher `uSNChanged` value, compare their stable attribute digest with the inventory, and write diff files instead of replacing the full baseline reports:
+
+- `domain_diff.json`: aggregate JSON diff with `add`, `modify` and `delete` operations
+- `domain_users.diff.json`, `domain_computers.diff.json`, `domain_groups.diff.json`, `domain_policy.diff.json` and `domain_trusts.diff.json`: per-object-type JSON diffs
+- `domain_diff.grep` and `domain_diff.html`: greppable and HTML diff views
+
+The collector uses LDAP paged results and saves the page cookie plus the last committed uSNChanged after every page. If a run is interrupted, the next invocation resumes the incomplete run from the staged page boundary. Changed records are staged and deduplicated before the inventory and cursor are committed, so a resumed run does not emit duplicate changes.
+
+Deletion detection is best effort and uses the AD `isDeleted` tombstone objects. It can be disabled with `--no-deleted-check` when the account has no permission to read deleted objects. A uSNChanged cursor is specific to one domain controller and resets when a DC is restored, so the state file records the DC invocation ID and automatically starts a new baseline if the source changes. Use `--reset-state` to force a new baseline manually.
+
+The test suite includes a 100,000-object baseline/incremental test and a pagination interruption/resume test:
+```
+python -m pip install -e '.[test]'
+python -m pytest -q
+```
 
 ## Visualizing groups with BloodHound
 LDAPDomainDump includes a utility that can be used to convert ldapdomaindumps `.json` files to CSV files suitable for BloodHound. The utility is called `ldd2bloodhound` and is added to your path upon installation. Alternatively you can run it with `python -m ldapdomaindump.convert` or with `python ldapdomaindump/convert.py` if you are running it from the source.

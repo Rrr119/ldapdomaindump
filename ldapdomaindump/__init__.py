@@ -35,6 +35,10 @@ from ldap3.protocol.formatters.formatters import format_sid
 # dnspython, for resolving hostnames
 import dns.resolver
 
+from .incremental import (
+    IncrementalCollector, DEFAULT_PAGE_SIZE
+)
+
 
 # User account control flags
 # From: https://blogs.technet.microsoft.com/askpfeplat/2014/01/15/understanding-the-useraccountcontrol-attribute-in-active-directory/
@@ -150,6 +154,11 @@ class domainDumpConfig():
         self.lookuphostnames = False #Look up hostnames of computers to get their IP address
         self.dnsserver = '' #Addres of the DNS server to use, if not specified default DNS will be used
         self.minimal = False #Only query minimal list of attributes
+        self.incremental = False #Only collect objects changed since the last run
+        self.statefile = None #Incremental checkpoint and inventory file
+        self.pagesize = DEFAULT_PAGE_SIZE #LDAP page size for incremental collection
+        self.resetstate = False #Discard the incremental checkpoint before running
+        self.deletedcheck = True #Query tombstones for incremental deletions
 
 #Domaindumper main class
 class domainDumper():
@@ -407,6 +416,8 @@ class domainDumper():
 
     #Main function
     def domainDump(self):
+        if self.config.incremental:
+            return self.incrementalDomainDump()
         self.users = self.getAllUsers()
         self.computers = self.getAllComputers()
         self.groups = self.getAllGroups()
@@ -422,6 +433,58 @@ class domainDumper():
         rw.generateTrustsReport(self)
         rw.generateComputersByOsReport(self)
         rw.generateUsersByGroupReport(self)
+
+    #Incremental variant of the main function. It keeps a uSNChanged cursor
+    #and writes only differences after the initial baseline.
+    def incrementalDomainDump(self):
+        if self.config.statefile is None:
+            self.config.statefile = os.path.join(
+                self.config.basepath, '.ldapdomaindump-state.json'
+            )
+        collector = IncrementalCollector(
+            self.connection,
+            self.root,
+            self.config.statefile,
+            page_size=self.config.pagesize,
+            minimal=self.config.minimal,
+            reset=self.config.resetstate,
+            warn=log_warn,
+            allow_delete_check=self.config.deletedcheck,
+        )
+        result = collector.run()
+        self.users = result.entries_by_type['users']
+        self.computers = result.entries_by_type['computers']
+        self.groups = result.entries_by_type['groups']
+        self.policy = result.entries_by_type['policy']
+        self.trusts = result.entries_by_type['trusts']
+
+        rw = reportWriter(self.config)
+        if result.baseline:
+            if self.config.lookuphostnames:
+                self.lookupComputerDnsNames()
+            rw.generateUsersReport(self)
+            rw.generateGroupsReport(self)
+            rw.generateComputersReport(self)
+            rw.generatePolicyReport(self)
+            rw.generateTrustsReport(self)
+            rw.generateComputersByOsReport(self)
+            rw.generateUsersByGroupReport(self)
+            log_success(
+                'Baseline complete at uSNChanged %d (%d objects)' % (
+                    result.to_usn, result.inventory_count
+                )
+            )
+        else:
+            rw.generateDiffReports(result)
+            summary = result.summary()
+            log_success(
+                'Incremental diff uSNChanged %d -> %d: %d add, %d modify, '
+                '%d delete' % (
+                    result.from_usn, result.to_usn, summary['add'],
+                    summary['modify'], summary['delete']
+                )
+            )
+        return result
 
 class reportWriter():
     def __init__(self, config):
@@ -857,6 +920,81 @@ class reportWriter():
             jsonout = self.generateJsonList(dd.trusts)
             self.writeJsonFile('%s.json' % self.config.trustsfile, jsonout)
 
+    #Generate difference reports for an incremental run. The full reports are
+    #not rewritten because an incremental query only contains changed objects.
+    def generateDiffReports(self, result):
+        changes = [change.to_dict() for change in result.changes]
+        report = {
+            'base_dn': result.base_dn,
+            'from_usn': result.from_usn,
+            'to_usn': result.to_usn,
+            'generated_at': result.generated_at,
+            'summary': result.summary(),
+            'changes': changes,
+        }
+
+        if self.config.outputjson:
+            self.writeJsonFile(
+                'domain_diff.json',
+                json.dumps(report, ensure_ascii=True, sort_keys=True, indent=2)
+            )
+            category_files = {
+                'users': self.config.usersfile,
+                'computers': self.config.computersfile,
+                'groups': self.config.groupsfile,
+                'policy': self.config.policyfile,
+                'trusts': self.config.trustsfile,
+            }
+            for category, basename in category_files.items():
+                category_changes = [
+                    change for change in changes
+                    if change['object_type'] == category
+                ]
+                category_report = {
+                    'base_dn': result.base_dn,
+                    'from_usn': result.from_usn,
+                    'to_usn': result.to_usn,
+                    'generated_at': result.generated_at,
+                    'changes': category_changes,
+                }
+                self.writeJsonFile(
+                    '%s.diff.json' % basename,
+                    json.dumps(
+                        category_report, ensure_ascii=True, sort_keys=True,
+                        indent=2
+                    )
+                )
+
+        if self.config.outputgrep:
+            lines = ['operation\tobject_type\tdn']
+            for change in changes:
+                dn = change['dn'].replace('\t', ' ').replace('\n', ' ')
+                lines.append('%s\t%s\t%s' % (
+                    change['operation'], change['object_type'], dn
+                ))
+            self.writeGrepFile('domain_diff.grep', '\n'.join(lines))
+
+        if self.config.outputhtml:
+            body = [
+                '<h1>Domain changes</h1>',
+                '<p>uSNChanged %d to %d. Generated %s.</p>' % (
+                    result.from_usn, result.to_usn,
+                    self.htmlescape(result.generated_at)
+                ),
+                '<table><thead><tr><th>Operation</th><th>Object type</th>'
+                '<th>Distinguished name</th></tr></thead><tbody>',
+            ]
+            for change in changes:
+                body.append(
+                    '<tr><td>%s</td><td>%s</td><td>%s</td></tr>' % (
+                        self.htmlescape(change['operation']),
+                        self.htmlescape(change['object_type']),
+                        self.htmlescape(change['dn']),
+                    )
+                )
+            body.append('</tbody>')
+            self.writeHtmlFile('domain_diff.html', ''.join(body))
+
 #Some quick logging helpers
 def log_warn(text):
     print('[!] %s' % text)
@@ -866,6 +1004,12 @@ def log_success(text):
     print('[+] %s' % text)
 
 def main():
+    def positive_int(value):
+        parsed = int(value)
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError('must be a positive integer')
+        return parsed
+
     parser = argparse.ArgumentParser(description='Domain information dumper via LDAP. Dumps users/computers/groups and OS/membership information to HTML/JSON/greppable output.')
     parser._optionals.title = "Main options"
     parser._positionals.title = "Required options"
@@ -885,6 +1029,14 @@ def main():
     outputgroup.add_argument("--no-grep", action='store_true', help="Disable Greppable output")
     outputgroup.add_argument("--grouped-json", action='store_true', default=False, help="Also write json files for grouped files (default: disabled)")
     outputgroup.add_argument("-d", "--delimiter", help="Field delimiter for greppable output (default: tab)")
+
+    #Incremental collection options
+    incrementalgroup = parser.add_argument_group("Incremental options")
+    incrementalgroup.add_argument("-i", "--incremental", action='store_true', help="Collect only objects changed since the previous run using uSNChanged")
+    incrementalgroup.add_argument("--state-file", type=str, metavar='FILE', help="Incremental checkpoint and inventory file (default: OUTDIR/.ldapdomaindump-state.json)")
+    incrementalgroup.add_argument("--page-size", type=positive_int, default=DEFAULT_PAGE_SIZE, metavar='N', help="LDAP page size for incremental collection (default: 500)")
+    incrementalgroup.add_argument("--reset-state", action='store_true', help="Discard the incremental checkpoint and start with a new baseline")
+    incrementalgroup.add_argument("--no-deleted-check", action='store_true', help="Do not query AD tombstones for deleted objects during incremental runs")
 
     #Additional options
     miscgroup = parser.add_argument_group("Misc options")
@@ -919,6 +1071,15 @@ def main():
     #Custom outdir?
     if args.outdir is not None:
         cnf.basepath = args.outdir
+    #Incremental collection?
+    cnf.incremental = args.incremental
+    cnf.pagesize = args.page_size
+    cnf.resetstate = args.reset_state
+    cnf.deletedcheck = not args.no_deleted_check
+    if args.state_file is not None:
+        cnf.statefile = args.state_file
+    else:
+        cnf.statefile = os.path.join(cnf.basepath, '.ldapdomaindump-state.json')
     #Do we really need grouped json files?
     cnf.groupedjson = args.grouped_json
 
